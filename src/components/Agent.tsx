@@ -22,6 +22,14 @@ interface Message {
   content: string;
 }
 
+// Speech Recognition types
+declare global {
+  interface Window {
+    webkitSpeechRecognition: any;
+    SpeechRecognition: any;
+  }
+}
+
 const Agent = ({ 
   userName = "User", 
   type = "interview",
@@ -35,6 +43,7 @@ const Agent = ({
   const [isCallActive, setIsCallActive] = useState(false);
   const [isSpeaking, setIsSpeaking] = useState(false);
   const [isMuted, setIsMuted] = useState(false);
+  const [isListening, setIsListening] = useState(false);
   const [messages, setMessages] = useState<Message[]>([]);
   const [inputText, setInputText] = useState("");
   const [isProcessing, setIsProcessing] = useState(false);
@@ -44,6 +53,9 @@ const Agent = ({
   const navigate = useNavigate();
   const { toast } = useToast();
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const recognitionRef = useRef<any>(null);
+  const speechSynthesisRef = useRef<SpeechSynthesisUtterance | null>(null);
+  const streamChatRef = useRef<((message: string) => Promise<void>) | null>(null);
 
   const systemPrompt = `You are an expert AI interviewer conducting a mock ${interviewType} interview for a ${role} position.
 
@@ -68,15 +80,220 @@ Start by greeting the candidate named ${userName}, briefly introduce yourself as
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
 
+  // Initialize speech recognition
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SpeechRecognition) {
+      console.warn('Speech recognition not supported in this browser');
+      return;
+    }
+
+    const recognition = new SpeechRecognition();
+    recognition.continuous = false;
+    recognition.interimResults = false;
+    recognition.lang = 'en-US';
+
+    recognition.onstart = () => {
+      setIsListening(true);
+    };
+
+    recognition.onend = () => {
+      setIsListening(false);
+      // Restart listening if call is active and not muted and not speaking
+      if (isCallActive && !isMuted && !isSpeaking && !isProcessing) {
+        setTimeout(() => {
+          if (isCallActive && !isMuted && !isSpeaking) {
+            try {
+              recognition.start();
+            } catch (e) {
+              // Already started or error
+            }
+          }
+        }, 500);
+      }
+    };
+
+    recognition.onerror = (event: any) => {
+      console.error('Speech recognition error:', event.error);
+      setIsListening(false);
+      if (event.error === 'no-speech') {
+        // Restart listening if no speech detected
+        if (isCallActive && !isMuted && !isSpeaking) {
+          setTimeout(() => {
+            try {
+              recognition.start();
+            } catch (e) {
+              // Already started or error
+            }
+          }, 1000);
+        }
+      }
+    };
+
+    recognition.onresult = async (event: any) => {
+      const transcript = event.results[0][0].transcript;
+      if (transcript.trim() && streamChatRef.current) {
+        // Stop listening while processing
+        recognition.stop();
+        setIsListening(false);
+        // Send the transcript as a message
+        await streamChatRef.current(transcript);
+      }
+    };
+
+    recognitionRef.current = recognition;
+
+    return () => {
+      if (recognitionRef.current) {
+        try {
+          recognitionRef.current.stop();
+        } catch (e) {
+          // Ignore errors
+        }
+      }
+    };
+  }, [isCallActive, isMuted, isSpeaking, isProcessing]);
+
+  // Cleanup speech synthesis on unmount
+  useEffect(() => {
+    return () => {
+      if (speechSynthesisRef.current) {
+        window.speechSynthesis.cancel();
+      }
+    };
+  }, []);
+
+  // Text-to-speech function with natural, conversational voice
+  const speakText = useCallback((text: string): Promise<void> => {
+    return new Promise((resolve) => {
+      if (!('speechSynthesis' in window)) {
+        console.warn('Speech synthesis not supported');
+        resolve();
+        return;
+      }
+
+      // Cancel any ongoing speech
+      window.speechSynthesis.cancel();
+
+      const utterance = new SpeechSynthesisUtterance(text);
+      
+      // More natural, conversational settings (less formal)
+      utterance.rate = 1.1; // Slightly faster = more natural and conversational
+      utterance.pitch = 0.95; // Slightly lower pitch = more natural, less robotic
+      utterance.volume = 1.0;
+      utterance.lang = 'en-US';
+
+      // Try to select a more natural voice if available
+      const voices = window.speechSynthesis.getVoices();
+      if (voices.length > 0) {
+        // Prefer natural-sounding voices (common names for natural voices)
+        const preferredVoices = voices.filter(voice => 
+          voice.lang.startsWith('en') && (
+            voice.name.toLowerCase().includes('natural') ||
+            voice.name.toLowerCase().includes('premium') ||
+            voice.name.toLowerCase().includes('neural') ||
+            voice.name.toLowerCase().includes('enhanced') ||
+            voice.name.toLowerCase().includes('samantha') ||
+            voice.name.toLowerCase().includes('alex') ||
+            voice.name.toLowerCase().includes('daniel') ||
+            voice.name.toLowerCase().includes('google')
+          )
+        );
+        
+        if (preferredVoices.length > 0) {
+          utterance.voice = preferredVoices[0];
+        } else {
+          // Fallback to any English voice
+          const englishVoices = voices.filter(voice => voice.lang.startsWith('en'));
+          if (englishVoices.length > 0) {
+            utterance.voice = englishVoices[0];
+          }
+        }
+      }
+
+      utterance.onstart = () => {
+        setIsSpeaking(true);
+      };
+
+      utterance.onend = () => {
+        setIsSpeaking(false);
+        speechSynthesisRef.current = null;
+        resolve();
+      };
+
+      utterance.onerror = (event) => {
+        console.error('Speech synthesis error:', event);
+        setIsSpeaking(false);
+        speechSynthesisRef.current = null;
+        resolve();
+      };
+
+      speechSynthesisRef.current = utterance;
+      
+      // If voices are not loaded yet, wait for them
+      if (voices.length === 0) {
+        window.speechSynthesis.onvoiceschanged = () => {
+          const updatedVoices = window.speechSynthesis.getVoices();
+          const preferredVoices = updatedVoices.filter(voice => 
+            voice.lang.startsWith('en') && (
+              voice.name.toLowerCase().includes('natural') ||
+              voice.name.toLowerCase().includes('premium') ||
+              voice.name.toLowerCase().includes('neural') ||
+              voice.name.toLowerCase().includes('enhanced') ||
+              voice.name.toLowerCase().includes('samantha') ||
+              voice.name.toLowerCase().includes('alex') ||
+              voice.name.toLowerCase().includes('daniel') ||
+              voice.name.toLowerCase().includes('google')
+            )
+          );
+          
+          if (preferredVoices.length > 0) {
+            utterance.voice = preferredVoices[0];
+          } else {
+            const englishVoices = updatedVoices.filter(voice => voice.lang.startsWith('en'));
+            if (englishVoices.length > 0) {
+              utterance.voice = englishVoices[0];
+            }
+          }
+          
+          window.speechSynthesis.speak(utterance);
+        };
+      } else {
+        window.speechSynthesis.speak(utterance);
+      }
+    });
+  }, []);
+
   const streamChat = async (userMessage: string) => {
     setIsProcessing(true);
-    setIsSpeaking(true);
 
-    const newMessages = [...messages, { role: "user" as const, content: userMessage }];
-    setMessages(newMessages);
+    let newMessages: Message[] = [];
+    setMessages(prev => {
+      newMessages = [...prev, { role: "user" as const, content: userMessage }];
+      return newMessages;
+    });
     setTranscript(prev => [...prev, `${userName}: ${userMessage}`]);
 
     try {
+      const systemPromptValue = `You are an expert AI interviewer conducting a mock ${interviewType} interview for a ${role} position.
+
+${techStack.length > 0 ? `The candidate should be familiar with: ${techStack.join(', ')}` : ''}
+
+Your behavior:
+- Be professional, friendly, and encouraging
+- Ask one question at a time and wait for the candidate's response
+- Provide brief acknowledgments (1-2 sentences) before moving to the next question
+- If the candidate seems stuck, offer gentle prompts
+- Keep responses concise for natural conversation flow
+- When all questions are asked, thank the candidate and let them know feedback will be ready shortly
+
+${questions.length > 0 ? `Interview questions to ask (in order):
+${questions.map((q, i) => `${i + 1}. ${q}`).join('\n')}` : ''}
+
+Start by greeting the candidate named ${userName}, briefly introduce yourself as their AI interviewer, and ask the first question.`;
+
       const response = await fetch(
         `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/ai-chat`,
         {
@@ -87,7 +304,7 @@ Start by greeting the candidate named ${userName}, briefly introduce yourself as
           },
           body: JSON.stringify({ 
             messages: newMessages.map(m => ({ role: m.role, content: m.content })),
-            systemPrompt 
+            systemPrompt: systemPromptValue
           }),
         }
       );
@@ -122,14 +339,21 @@ Start by greeting the candidate named ${userName}, briefly introduce yourself as
           const jsonStr = line.slice(6).trim();
           if (jsonStr === "[DONE]") break;
 
-          try {
-            const parsed = JSON.parse(jsonStr);
-            const content = parsed.choices?.[0]?.delta?.content;
-            if (content) {
-              assistantMessage += content;
-              setMessages([...newMessages, { role: "assistant", content: assistantMessage }]);
-            }
-          } catch {
+              try {
+                const parsed = JSON.parse(jsonStr);
+                const content = parsed.choices?.[0]?.delta?.content;
+                if (content) {
+                  assistantMessage += content;
+                  setMessages(prev => {
+                    // If last message is assistant, replace it; otherwise append
+                    const lastMsg = prev[prev.length - 1];
+                    if (lastMsg?.role === "assistant") {
+                      return [...prev.slice(0, -1), { role: "assistant", content: assistantMessage }];
+                    }
+                    return [...prev, { role: "assistant", content: assistantMessage }];
+                  });
+                }
+              } catch {
             buffer = line + "\n" + buffer;
             break;
           }
@@ -138,10 +362,29 @@ Start by greeting the candidate named ${userName}, briefly introduce yourself as
 
       setTranscript(prev => [...prev, `AI Interviewer: ${assistantMessage}`]);
       
-      // Check if we should move to next question
-      if (currentQuestionIndex < questions.length - 1) {
-        setCurrentQuestionIndex(prev => prev + 1);
+      // Speak the AI response
+      if (assistantMessage.trim()) {
+        await speakText(assistantMessage);
       }
+      
+      // Check if we should move to next question
+      setCurrentQuestionIndex(prev => {
+        if (prev < questions.length - 1) {
+          return prev + 1;
+        }
+        return prev;
+      });
+
+      // Restart listening after AI finishes speaking - use a ref to check state
+      setTimeout(() => {
+        if (recognitionRef.current) {
+          try {
+            recognitionRef.current.start();
+          } catch (e) {
+            // Already started or error - will be handled by onend/onerror
+          }
+        }
+      }, 500);
 
     } catch (error) {
       console.error("Chat error:", error);
@@ -152,15 +395,34 @@ Start by greeting the candidate named ${userName}, briefly introduce yourself as
       });
     } finally {
       setIsProcessing(false);
-      setIsSpeaking(false);
     }
   };
+
+  // Update the ref when component mounts/updates
+  useEffect(() => {
+    streamChatRef.current = streamChat;
+  });
 
   const handleCall = async () => {
     if (isCallActive) {
       // End call - generate feedback
       setIsCallActive(false);
       setIsSpeaking(false);
+      setIsListening(false);
+      
+      // Stop speech recognition
+      if (recognitionRef.current) {
+        try {
+          recognitionRef.current.stop();
+        } catch (e) {
+          // Ignore errors
+        }
+      }
+      
+      // Stop speech synthesis
+      if (speechSynthesisRef.current) {
+        window.speechSynthesis.cancel();
+      }
       
       if (onComplete) {
         onComplete(transcript.join("\n\n"));
@@ -170,8 +432,32 @@ Start by greeting the candidate named ${userName}, briefly introduce yourself as
       }
     } else {
       setIsCallActive(true);
-      // Send initial greeting
+      
+      // Check if speech recognition is available
+      const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+      if (!SpeechRecognition) {
+        toast({
+          variant: "destructive",
+          title: "Voice not supported",
+          description: "Your browser doesn't support speech recognition. You can still use text input.",
+        });
+      }
+      
+      // Send initial greeting (will trigger voice)
       await streamChat("Hello, I'm ready to begin the interview.");
+      
+      // Start listening after a short delay
+      if (!isMuted && recognitionRef.current) {
+        setTimeout(() => {
+          if (isCallActive && !isMuted && !isSpeaking) {
+            try {
+              recognitionRef.current.start();
+            } catch (e) {
+              // Already started or error
+            }
+          }
+        }, 2000);
+      }
     }
   };
 
@@ -191,7 +477,31 @@ Start by greeting the candidate named ${userName}, briefly introduce yourself as
   };
 
   const toggleMute = () => {
-    setIsMuted(!isMuted);
+    const newMutedState = !isMuted;
+    setIsMuted(newMutedState);
+    
+    if (recognitionRef.current) {
+      if (newMutedState) {
+        // Stop listening when muted
+        try {
+          recognitionRef.current.stop();
+        } catch (e) {
+          // Ignore errors
+        }
+        setIsListening(false);
+      } else if (isCallActive && !isSpeaking && !isProcessing) {
+        // Start listening when unmuted
+        setTimeout(() => {
+          if (isCallActive && !isMuted && !isSpeaking) {
+            try {
+              recognitionRef.current.start();
+            } catch (e) {
+              // Already started or error
+            }
+          }
+        }, 500);
+      }
+    }
   };
 
   return (
@@ -223,7 +533,13 @@ Start by greeting the candidate named ${userName}, briefly introduce yourself as
           </div>
 
           <h3 className="text-center text-primary-100 mt-4 font-semibold">
-            {isCallActive ? (isSpeaking ? "AI is responding..." : "Listening...") : "AI Interviewer"}
+            {isCallActive 
+              ? (isSpeaking 
+                  ? "AI is speaking..." 
+                  : (isListening && !isMuted 
+                      ? "Listening..." 
+                      : (isMuted ? "Muted" : "Ready")))
+              : "AI Interviewer"}
           </h3>
 
           {/* Call Controls */}
@@ -281,7 +597,13 @@ Start by greeting the candidate named ${userName}, briefly introduce yourself as
             </div>
             <h3 className="text-center text-foreground font-semibold">{userName}</h3>
             <p className="text-muted-foreground text-sm">
-              {isCallActive ? (isMuted ? "Muted" : "Connected") : "Ready to connect"}
+              {isCallActive 
+                ? (isMuted 
+                    ? "Muted" 
+                    : (isListening 
+                        ? "Listening..." 
+                        : "Connected")) 
+                : "Ready to connect"}
             </p>
             {isCallActive && (
               <div className="flex items-center gap-2 text-xs text-muted-foreground">
